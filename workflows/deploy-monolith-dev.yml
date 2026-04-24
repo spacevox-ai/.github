@@ -1,0 +1,274 @@
+# ==============================================================================
+# SpaceVox Monolith - Dev Deployment Pipeline
+# ==============================================================================
+# 
+# Builds and deploys the monolith to the dev environment (single EC2 instance).
+# 
+# Triggers:
+#   - Push to develop branch (filtered paths)
+#   - Manual workflow dispatch
+#   - Called by publish-all-packages after base/service updates
+#
+# Flow:
+#   1. Build monolith JAR (pulls dependencies from GitHub Packages)
+#   2. Build Docker image
+#   3. Push to ECR
+#   4. Watchtower on EC2 auto-pulls and restarts
+#
+# ==============================================================================
+
+name: Deploy Monolith (Dev)
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'spacevox-monolith/**'
+      - 'base-*/**'
+      - 'account/**'
+      - 'catalog/**'
+      - 'config/**'
+      - 'connection/**'
+      - 'portal/**'
+      - 'run/**'
+      - 'storage/**'
+      - 'subscription/**'
+      - 'task/**'
+      - 'trigger/**'
+      - 'webhook/**'
+      - 'insights/**'
+      - 'notification/**'
+      - 'ai-runtime/**'
+      - 'studio-management/**'
+      - 'kb-worker/**'
+      - 'workflow-gateway/**'
+  
+  workflow_dispatch:
+    inputs:
+      rebuild_all_deps:
+        description: 'Rebuild all dependencies (base modules + services)'
+        required: false
+        default: 'false'
+        type: boolean
+      skip_push:
+        description: 'Skip pushing to ECR (build only)'
+        required: false
+        default: 'false'
+        type: boolean
+
+  # Can be called by other workflows
+  workflow_call:
+    inputs:
+      rebuild_base:
+        description: 'Rebuild base modules first'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: 109958268025.dkr.ecr.us-west-2.amazonaws.com
+  JAVA_VERSION: '21'
+  # Increased memory to prevent OOM during multi-module builds
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  # ===========================================================================
+  # Detect What Changed
+  # ===========================================================================
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      base_changed: ${{ steps.changes.outputs.base }}
+      services_changed: ${{ steps.changes.outputs.services }}
+      monolith_changed: ${{ steps.changes.outputs.monolith }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect Changes
+        id: changes
+        run: |
+          # Check what changed in last commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          
+          # Check base modules
+          if echo "$CHANGED_FILES" | grep -E "^base-" > /dev/null; then
+            echo "base=true" >> $GITHUB_OUTPUT
+          else
+            echo "base=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check services
+          if echo "$CHANGED_FILES" | grep -E "^(account|catalog|config|connection|portal|run|storage|subscription|task|trigger|webhook|insights|notification|ai-runtime|studio-management|kb-worker|workflow-gateway)/" > /dev/null; then
+            echo "services=true" >> $GITHUB_OUTPUT
+          else
+            echo "services=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check monolith
+          if echo "$CHANGED_FILES" | grep -E "^spacevox-monolith/" > /dev/null; then
+            echo "monolith=true" >> $GITHUB_OUTPUT
+          else
+            echo "monolith=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ===========================================================================
+  # Rebuild Base Modules (if needed)
+  # ===========================================================================
+  rebuild-base:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.base_changed == 'true' || inputs.rebuild_all_deps == 'true' }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Build and Publish Base Modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Build in dependency order
+          for module in base-common base-multi-tenant base-rls base-ai-common base-secret-store base-http base-conversation base-api-contracts base-tool-execution base-tool-execution-impl base-data-exchange base-mcp base-test-utils base-dataplane-common; do
+            if [ -d "$module" ]; then
+              echo "Building $module..."
+              cd $module
+              mvn -B clean deploy -DskipTests \
+                -Dmaven.javadoc.skip=true \
+                -DaltDeploymentRepository=github::https://maven.pkg.github.com/spacevox-ai/spacevox-workspace
+              cd ..
+            fi
+          done
+
+  # ===========================================================================
+  # Rebuild Services (if needed)
+  # ===========================================================================
+  rebuild-services:
+    needs: [detect-changes, rebuild-base]
+    if: |
+      always() && 
+      (needs.rebuild-base.result == 'success' || needs.rebuild-base.result == 'skipped') &&
+      (needs.detect-changes.outputs.services_changed == 'true' || needs.detect-changes.outputs.base_changed == 'true' || inputs.rebuild_all_deps == 'true')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Build and Publish Services
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for service in account catalog config connection portal run storage subscription task trigger webhook insights notification ai-runtime studio-management kb-worker workflow-gateway; do
+            if [ -d "$service" ]; then
+              echo "Building $service..."
+              cd $service
+              mvn -B clean deploy -DskipTests \
+                -Dmaven.javadoc.skip=true \
+                -DaltDeploymentRepository=github::https://maven.pkg.github.com/spacevox-ai/spacevox-workspace
+              cd ..
+            fi
+          done
+
+  # ===========================================================================
+  # Build Monolith Docker Image
+  # ===========================================================================
+  build-monolith:
+    needs: [detect-changes, rebuild-base, rebuild-services]
+    if: always() && (needs.rebuild-base.result == 'success' || needs.rebuild-base.result == 'skipped') && (needs.rebuild-services.result == 'success' || needs.rebuild-services.result == 'skipped')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Build Monolith JAR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: spacevox-monolith
+        run: |
+          mvn -B clean package -DskipTests \
+            -Dmaven.javadoc.skip=true
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        if: ${{ inputs.skip_push != 'true' }}
+        working-directory: spacevox-monolith
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::8}"
+          
+          docker build -t $ECR_REGISTRY/spacevox/monolith:$IMAGE_TAG \
+                       -t $ECR_REGISTRY/spacevox/monolith:latest \
+                       -t $ECR_REGISTRY/spacevox/monolith:dev \
+                       .
+          
+          docker push $ECR_REGISTRY/spacevox/monolith:$IMAGE_TAG
+          docker push $ECR_REGISTRY/spacevox/monolith:latest
+          docker push $ECR_REGISTRY/spacevox/monolith:dev
+          
+          echo "### 🚀 Monolith Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`$ECR_REGISTRY/spacevox/monolith:$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Watchtower on EC2 will auto-pull within 60 seconds." >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Summary
+  # ===========================================================================
+  summary:
+    needs: [detect-changes, rebuild-base, rebuild-services, build-monolith]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Base Changed | ${{ needs.detect-changes.outputs.base_changed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Services Changed | ${{ needs.detect-changes.outputs.services_changed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rebuild Base | ${{ needs.rebuild-base.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rebuild Services | ${{ needs.rebuild-services.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Monolith | ${{ needs.build-monolith.result }} |" >> $GITHUB_STEP_SUMMARY

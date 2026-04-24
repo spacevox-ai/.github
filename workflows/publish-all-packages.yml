@@ -1,0 +1,333 @@
+# ==============================================================================
+# SpaceVox - Orchestrated Package Publishing
+# ==============================================================================
+# 
+# Publishes all packages to GitHub Packages in the correct dependency order.
+# Run this workflow to ensure all dependencies are available.
+#
+# Dependency Order:
+#   Level 1: base-common, base-multi-tenant, base-rls (no internal deps)
+#   Level 2: base-ai-common, base-secret-store, base-tool-execution, base-http, base-conversation
+#   Level 3: base-api-contracts, base-tool-execution-impl
+#   Level 4: base-data-exchange, base-mcp, base-test-utils
+#   Level 5: base-dataplane-common
+#   Level 6: All services (account, catalog, config, etc.)
+#
+# ==============================================================================
+
+name: Publish All Packages (Orchestrated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_level:
+        description: 'Start from level (1-6)'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+
+env:
+  JAVA_VERSION: '21'
+  # Increased memory to prevent OOM during publishing
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ==========================================================================
+  # LEVEL 1: No internal dependencies
+  # ==========================================================================
+  level-1-base-common:
+    if: ${{ github.event.inputs.start_level == '1' || github.event.inputs.start_level == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/base-common
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Publish base-common
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  level-1-base-multi-tenant:
+    if: ${{ github.event.inputs.start_level == '1' || github.event.inputs.start_level == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/base-multi-tenant
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Publish base-multi-tenant
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  level-1-base-rls:
+    if: ${{ github.event.inputs.start_level == '1' || github.event.inputs.start_level == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/base-rls
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Publish base-rls
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # LEVEL 2: Depends on Level 1
+  # ==========================================================================
+  level-2:
+    needs: [level-1-base-common, level-1-base-multi-tenant, level-1-base-rls]
+    if: always() && (needs.level-1-base-common.result == 'success' || github.event.inputs.start_level >= '2')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [base-ai-common, base-secret-store, base-tool-execution, base-http, base-conversation]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/${{ matrix.repo }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server><id>github-base-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-rls</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+            </servers>
+          </settings>
+          EOF
+      - name: Publish ${{ matrix.repo }}
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # LEVEL 3: Depends on Level 2
+  # ==========================================================================
+  level-3:
+    needs: [level-2]
+    if: always() && (needs.level-2.result == 'success' || github.event.inputs.start_level >= '3')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [base-api-contracts, base-tool-execution-impl]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/${{ matrix.repo }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server><id>github-base-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-http</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-tool-execution</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+            </servers>
+          </settings>
+          EOF
+      - name: Publish ${{ matrix.repo }}
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # LEVEL 4: Depends on Level 3
+  # ==========================================================================
+  level-4:
+    needs: [level-3]
+    if: always() && (needs.level-3.result == 'success' || github.event.inputs.start_level >= '4')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [base-data-exchange, base-mcp, base-test-utils]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/${{ matrix.repo }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server><id>github-base-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-http</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-api-contracts</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+            </servers>
+          </settings>
+          EOF
+      - name: Publish ${{ matrix.repo }}
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # LEVEL 5: Depends on Level 4
+  # ==========================================================================
+  level-5:
+    needs: [level-4]
+    if: always() && (needs.level-4.result == 'success' || github.event.inputs.start_level >= '5')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/base-dataplane-common
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server><id>github-base-api-contracts</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-data-exchange</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+            </servers>
+          </settings>
+          EOF
+      - name: Publish base-dataplane-common
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # LEVEL 6: Services (depend on base modules)
+  # ==========================================================================
+  level-6-services:
+    needs: [level-5]
+    if: always() && (needs.level-5.result == 'success' || github.event.inputs.start_level >= '6')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        repo:
+          - account
+          - catalog
+          - config
+          - connection
+          - notification
+          - portal
+          - run
+          - storage
+          - subscription
+          - task
+          - trigger
+          - webhook
+          - workflow-gateway
+          - ai-runtime
+          - studio-management
+          - kb-worker
+          - insights
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: spacevox-ai/${{ matrix.repo }}
+          token: ${{ secrets.GH_PAT }}
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      - name: Configure Maven settings
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server><id>github-base-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-http</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-api-contracts</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-data-exchange</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-rls</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-ai-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-secret-store</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github-base-dataplane-common</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+              <server><id>github</id><username>${{ github.actor }}</username><password>${{ secrets.GITHUB_TOKEN }}</password></server>
+            </servers>
+          </settings>
+          EOF
+      - name: Publish ${{ matrix.repo }}
+        run: mvn -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    needs: [level-6-services]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## Package Publishing Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All packages have been published to GitHub Packages in dependency order." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "You can now run the spacevox-monolith build workflow." >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,139 @@
+# ==============================================================================
+# Reusable Workflow: Java Library Build & Publish
+# ==============================================================================
+# Usage in library repo:
+#   jobs:
+#     build:
+#       uses: spacevox/.github/.github/workflows/reusable-java-library.yml@main
+#       with:
+#         library-name: base-common
+#       secrets: inherit
+# ==============================================================================
+
+name: Java Library (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      library-name:
+        description: 'Library name (e.g., base-common, base-api-contracts)'
+        required: true
+        type: string
+      java-version:
+        description: 'Java version'
+        required: false
+        default: '21'
+        type: string
+      skip-tests:
+        description: 'Skip tests'
+        required: false
+        default: false
+        type: boolean
+      publish:
+        description: 'Publish to GitHub Packages'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+jobs:
+  # ===========================================================================
+  # Build & Test
+  # ===========================================================================
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Configure Maven (GitHub Packages)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.GITHUB_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Get Version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build & Test
+        run: |
+          SKIP_TESTS="${{ inputs.skip-tests == true && '-DskipTests' || '' }}"
+          mvn clean verify -B $SKIP_TESTS -Dmaven.javadoc.skip=true
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-jar
+          path: target/*.jar
+          retention-days: 7
+
+  # ===========================================================================
+  # Publish to GitHub Packages
+  # ===========================================================================
+  publish:
+    needs: build
+    if: inputs.publish == true && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Configure Maven (GitHub Packages)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.GITHUB_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+
+      - name: Publish to GitHub Packages
+        run: mvn deploy -B -DskipTests -Dmaven.javadoc.skip=true
+
+      - name: Summary
+        run: |
+          echo "## 📦 Published ${{ inputs.library-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Library** | ${{ inputs.library-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ needs.build.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY

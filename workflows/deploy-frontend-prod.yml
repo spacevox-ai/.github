@@ -1,0 +1,225 @@
+# ==============================================================================
+# work.studio Frontend Deployment to S3 (Production Environment)
+# ==============================================================================
+# Deploys designer and work-studio frontends to S3 static hosting
+# Domain: work.studio (app.work.studio, studio.work.studio)
+# Triggers on push to main branch when frontend files change
+# ==============================================================================
+
+name: Deploy Frontends (Prod)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'designer/**'
+      - 'work-studio/**'
+      - '.github/workflows/deploy-frontend-prod.yml'
+  workflow_dispatch:
+    inputs:
+      frontend:
+        description: 'Frontend to deploy'
+        required: true
+        type: choice
+        options:
+          - all
+          - designer
+          - work-studio
+
+env:
+  AWS_REGION: us-west-2
+  NODE_VERSION: '20'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Detect Changed Frontends
+  # ===========================================================================
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      designer: ${{ steps.filter.outputs.designer }}
+      work-studio: ${{ steps.filter.outputs.work-studio }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            designer:
+              - 'designer/**'
+            work-studio:
+              - 'work-studio/**'
+
+  # ===========================================================================
+  # Deploy Designer (app.work.studio)
+  # ===========================================================================
+  deploy-designer:
+    name: Deploy Designer
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.designer == 'true' || 
+      github.event.inputs.frontend == 'all' || 
+      github.event.inputs.frontend == 'designer'
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: designer/package-lock.json
+
+      - name: Install dependencies
+        working-directory: designer
+        run: npm ci
+
+      - name: Create .env for build
+        working-directory: designer
+        run: |
+          cat > .env << 'EOF'
+          VITE_API_URL=https://api.work.studio
+          VITE_AUTH_URL=https://auth.work.studio
+          VITE_AUTH_REALM=integration_platform
+          VITE_AUTH_CLIENT_ID=workflow-designer
+          EOF
+
+      - name: Build
+        working-directory: designer
+        run: npm run build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        working-directory: designer
+        run: |
+          aws s3 sync dist/ s3://app.work.studio \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # Upload index.html with no-cache
+          aws s3 cp dist/index.html s3://app.work.studio/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Upload any JSON files with short cache
+          find dist -name "*.json" -exec aws s3 cp {} s3://app.work.studio/{} \
+            --cache-control "public, max-age=300" \; 2>/dev/null || true
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Designer Deployed (Production)!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://app.work.studio" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Work Studio (studio.work.studio)
+  # ===========================================================================
+  deploy-work-studio:
+    name: Deploy Work Studio
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.work-studio == 'true' || 
+      github.event.inputs.frontend == 'all' || 
+      github.event.inputs.frontend == 'work-studio'
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: work-studio/package-lock.json
+
+      - name: Install dependencies
+        working-directory: work-studio
+        run: npm ci
+
+      - name: Create .env for build
+        working-directory: work-studio
+        run: |
+          cat > .env << 'EOF'
+          VITE_API_URL=https://api.work.studio
+          VITE_AUTH_URL=https://auth.work.studio
+          VITE_AUTH_REALM=integration_platform
+          VITE_AUTH_CLIENT_ID=tech-studio
+          EOF
+
+      - name: Build (web only)
+        working-directory: work-studio
+        run: npm run build:web
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        working-directory: work-studio
+        run: |
+          aws s3 sync dist/ s3://studio.work.studio \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # Upload index.html with no-cache
+          aws s3 cp dist/index.html s3://studio.work.studio/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Upload any JSON files with short cache
+          find dist -name "*.json" -exec aws s3 cp {} s3://studio.work.studio/{} \
+            --cache-control "public, max-age=300" \; 2>/dev/null || true
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Work Studio Deployed (Production)!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://studio.work.studio" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Notify on Completion
+  # ===========================================================================
+  notify:
+    name: Deployment Complete
+    needs: [deploy-designer, deploy-work-studio]
+    if: always() && (needs.deploy-designer.result == 'success' || needs.deploy-work-studio.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## ✅ Production Frontend Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Designer | https://app.work.studio |" >> $GITHUB_STEP_SUMMARY
+          echo "| Work Studio | https://studio.work.studio |" >> $GITHUB_STEP_SUMMARY

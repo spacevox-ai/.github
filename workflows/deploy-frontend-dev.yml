@@ -1,0 +1,302 @@
+# ==============================================================================
+# work.studio Frontend Deployment to S3 (Dev Environment)
+# ==============================================================================
+# Auto-deploys designer and work-studio frontends to S3 static hosting
+# Domain: dev.work.studio
+# Triggers on push to develop branch when frontend files change
+# ==============================================================================
+
+name: Deploy Frontends (Dev)
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - 'designer/**'
+      - 'work-studio/**'
+      - 'public-docs/**'
+      - '.github/workflows/deploy-frontend-dev.yml'
+  workflow_dispatch:
+    inputs:
+      frontend:
+        description: 'Frontend to deploy'
+        required: true
+        type: choice
+        options:
+          - all
+          - designer
+          - work-studio
+          - docs
+
+env:
+  AWS_REGION: us-west-2
+  NODE_VERSION: '20'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # Detect Changed Frontends
+  # ===========================================================================
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      designer: ${{ steps.filter.outputs.designer }}
+      work-studio: ${{ steps.filter.outputs.work-studio }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            designer:
+              - 'designer/**'
+            work-studio:
+              - 'work-studio/**'
+            docs:
+              - 'public-docs/**'
+
+  # ===========================================================================
+  # Deploy Designer
+  # ===========================================================================
+  deploy-designer:
+    name: Deploy Designer
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.designer == 'true' || 
+      github.event.inputs.frontend == 'all' || 
+      github.event.inputs.frontend == 'designer'
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: designer/package-lock.json
+
+      - name: Install dependencies
+        working-directory: designer
+        run: npm ci
+
+      - name: Create .env for build
+        working-directory: designer
+        run: |
+          cat > .env << 'EOF'
+          VITE_API_URL=https://api.dev.work.studio
+          VITE_AUTH_URL=https://auth.dev.work.studio
+          VITE_AUTH_REALM=integration_platform
+          VITE_AUTH_CLIENT_ID=workflow-designer
+          EOF
+
+      - name: Build
+        working-directory: designer
+        run: npm run build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        working-directory: designer
+        run: |
+          aws s3 sync dist/ s3://app.dev.work.studio \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # Upload index.html and JSON with no-cache
+          aws s3 cp dist/index.html s3://app.dev.work.studio/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Upload any JSON files with short cache
+          find dist -name "*.json" -exec aws s3 cp {} s3://app.dev.work.studio/{} \
+            --cache-control "public, max-age=300" \; 2>/dev/null || true
+
+      - name: Invalidate Cloudflare Cache (optional)
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"hosts":["app.dev.work.studio"]}' || true
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Designer Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://app.dev.work.studio" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Work Studio
+  # ===========================================================================
+  deploy-work-studio:
+    name: Deploy Work Studio
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.work-studio == 'true' || 
+      github.event.inputs.frontend == 'all' || 
+      github.event.inputs.frontend == 'work-studio'
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: work-studio/package-lock.json
+
+      - name: Install dependencies
+        working-directory: work-studio
+        run: npm ci
+
+      - name: Create .env for build
+        working-directory: work-studio
+        run: |
+          cat > .env << 'EOF'
+          VITE_API_URL=https://api.dev.work.studio
+          VITE_AUTH_URL=https://auth.dev.work.studio
+          VITE_AUTH_REALM=integration_platform
+          VITE_AUTH_CLIENT_ID=tech-studio
+          EOF
+
+      - name: Build (web only)
+        working-directory: work-studio
+        run: npm run build:web
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        working-directory: work-studio
+        run: |
+          aws s3 sync dist/ s3://studio.dev.work.studio \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # Upload index.html with no-cache for SPA routing
+          aws s3 cp dist/index.html s3://studio.dev.work.studio/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Upload any JSON files with short cache
+          find dist -name "*.json" -exec aws s3 cp {} s3://studio.dev.work.studio/{} \
+            --cache-control "public, max-age=300" \; 2>/dev/null || true
+
+      - name: Invalidate Cloudflare Cache (optional)
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"hosts":["studio.dev.work.studio"]}' || true
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Work Studio Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://studio.dev.work.studio" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Documentation
+  # ===========================================================================
+  deploy-docs:
+    name: Deploy Documentation
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.docs == 'true' || 
+      github.event.inputs.frontend == 'all' || 
+      github.event.inputs.frontend == 'docs'
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with Retype
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/public-docs:/app \
+            retypeapp/retype:latest \
+            retype build /app --output /app/.retype
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        working-directory: public-docs
+        run: |
+          # Sync all static assets with long cache
+          aws s3 sync .retype/ s3://docs.dev.work.studio \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "*.html" \
+            --exclude "*.json" \
+            --exclude "sitemap.xml" \
+            --exclude "robots.txt"
+          
+          # Upload HTML files with no-cache for fresh content
+          find .retype -name "*.html" | while read file; do
+            rel_path="${file#.retype/}"
+            aws s3 cp "$file" "s3://docs.dev.work.studio/$rel_path" \
+              --cache-control "no-cache, no-store, must-revalidate"
+          done
+          
+          # Upload JSON, sitemap, robots with short cache
+          for pattern in "*.json" "sitemap.xml" "robots.txt"; do
+            find .retype -name "$pattern" | while read file; do
+              rel_path="${file#.retype/}"
+              aws s3 cp "$file" "s3://docs.dev.work.studio/$rel_path" \
+                --cache-control "public, max-age=300"
+            done 2>/dev/null || true
+          done
+
+      - name: Invalidate Cloudflare Cache (optional)
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"hosts":["docs.dev.work.studio"]}' || true
+
+      - name: Summary
+        run: |
+          echo "## 📚 Documentation Deployed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** https://docs.dev.work.studio" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

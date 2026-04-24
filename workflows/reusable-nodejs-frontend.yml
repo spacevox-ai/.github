@@ -1,0 +1,195 @@
+# ==============================================================================
+# Reusable Workflow: Node.js Frontend Build & Deploy to S3
+# ==============================================================================
+# Usage in frontend repo:
+#   jobs:
+#     deploy:
+#       uses: spacevox/.github/.github/workflows/reusable-nodejs-frontend.yml@main
+#       with:
+#         app-name: designer
+#         s3-bucket-dev: designer-dev.spacevox.com
+#         s3-bucket-prod: designer.spacevox.com
+#       secrets: inherit
+# ==============================================================================
+
+name: Node.js Frontend (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name (e.g., designer, portal, work-studio)'
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version'
+        required: false
+        default: '20'
+        type: string
+      s3-bucket-dev:
+        description: 'S3 bucket for dev deployment'
+        required: true
+        type: string
+      s3-bucket-prod:
+        description: 'S3 bucket for production deployment'
+        required: true
+        type: string
+      build-command-dev:
+        description: 'Build command for dev'
+        required: false
+        default: 'npm run build:dev'
+        type: string
+      build-command-prod:
+        description: 'Build command for production'
+        required: false
+        default: 'npm run build:production'
+        type: string
+      cloudfront-distribution-dev:
+        description: 'CloudFront distribution ID for dev (optional)'
+        required: false
+        type: string
+      cloudfront-distribution-prod:
+        description: 'CloudFront distribution ID for production (optional)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  # ===========================================================================
+  # Determine Environment
+  # ===========================================================================
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      should-deploy: ${{ steps.env.outputs.should-deploy }}
+      s3-bucket: ${{ steps.env.outputs.s3-bucket }}
+      build-command: ${{ steps.env.outputs.build-command }}
+      cloudfront-id: ${{ steps.env.outputs.cloudfront-id }}
+      aws-account-id: ${{ steps.env.outputs.aws-account-id }}
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "environment=ci"
+            echo "should-deploy=false"
+            echo "s3-bucket="
+            echo "build-command=npm run build"
+            echo "cloudfront-id="
+            echo "aws-account-id="
+          elif [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
+            echo "environment=production"
+            echo "should-deploy=true"
+            echo "s3-bucket=${{ inputs.s3-bucket-prod }}"
+            echo "build-command=${{ inputs.build-command-prod }}"
+            echo "cloudfront-id=${{ inputs.cloudfront-distribution-prod }}"
+            echo "aws-account-id=646966486018"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
+            echo "environment=dev"
+            echo "should-deploy=true"
+            echo "s3-bucket=${{ inputs.s3-bucket-dev }}"
+            echo "build-command=${{ inputs.build-command-dev }}"
+            echo "cloudfront-id=${{ inputs.cloudfront-distribution-dev }}"
+            echo "aws-account-id=109958268025"
+          else
+            echo "environment=ci"
+            echo "should-deploy=false"
+          fi >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Build
+  # ===========================================================================
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+        continue-on-error: true
+
+      - name: Build
+        run: ${{ needs.setup.outputs.build-command || 'npm run build' }}
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
+
+  # ===========================================================================
+  # Deploy
+  # ===========================================================================
+  deploy:
+    needs: [setup, build]
+    if: needs.setup.outputs.should-deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.setup.outputs.environment }}
+    
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.setup.outputs.environment == 'production' && secrets.AWS_ROLE_ARN_PROD || secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: |
+          S3_BUCKET="${{ needs.setup.outputs.s3-bucket }}"
+          
+          # Sync all files with long cache (immutable assets)
+          aws s3 sync dist/ s3://$S3_BUCKET \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude "index.html" \
+            --exclude "*.json"
+          
+          # Upload index.html with no-cache (always fresh)
+          aws s3 cp dist/index.html s3://$S3_BUCKET/index.html \
+            --cache-control "no-cache, no-store, must-revalidate"
+          
+          # Upload JSON config files with short cache
+          find dist -name "*.json" -exec aws s3 cp {} s3://$S3_BUCKET/{} \
+            --cache-control "public, max-age=300" \; 2>/dev/null || true
+
+      - name: Invalidate CloudFront
+        if: needs.setup.outputs.cloudfront-id != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ needs.setup.outputs.cloudfront-id }}" \
+            --paths "/*"
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deployed ${{ inputs.app-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **App** | ${{ inputs.app-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | ${{ needs.setup.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **S3 Bucket** | ${{ needs.setup.outputs.s3-bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY

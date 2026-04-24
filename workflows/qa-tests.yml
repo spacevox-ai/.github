@@ -1,0 +1,702 @@
+name: QA Test Suite
+
+on:
+  # Manual trigger with parameters
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode to run'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - fast
+          - integration
+          - e2e
+          - security
+          - tenant-isolation
+          - load
+          - all
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'local'
+        type: choice
+        options:
+          - local
+          - qa
+          - staging
+
+  # Run smoke tests on PRs to main
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'qa-test-suite/**'
+      - '**/src/**/*.java'
+      - '**/pom.xml'
+      - '.github/workflows/qa-tests.yml'
+
+  # Run full E2E nightly
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM UTC daily
+
+env:
+  JAVA_VERSION: '21'
+  # Increased memory to prevent OOM
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+jobs:
+  # ===========================================================================
+  # Smoke Tests - Quick validation
+  # ===========================================================================
+  smoke-tests:
+    name: 🔥 Smoke Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_mode == 'smoke')
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Build QA Test Suite
+        run: mvn -B compile test-compile -f qa-test-suite/pom.xml
+
+      - name: Run Smoke Tests
+        run: |
+          mvn -B test \
+            -f qa-test-suite/pom.xml \
+            -Dgroups=smoke \
+            -Dqa.services.base-url=http://localhost
+        continue-on-error: true
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-results
+          path: qa-test-suite/target/surefire-reports/
+          retention-days: 7
+
+  # ===========================================================================
+  # Integration Tests
+  # ===========================================================================
+  integration-tests:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_mode == 'integration'
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+      localstack:
+        image: localstack/localstack:3.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,sqs,sns,secretsmanager
+          DEFAULT_REGION: us-west-2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build QA Test Suite
+        run: mvn -B compile test-compile -f qa-test-suite/pom.xml
+
+      - name: Run Integration Tests
+        run: |
+          mvn -B test \
+            -f qa-test-suite/pom.xml \
+            -Pintegration \
+            -Dqa.services.base-url=http://localhost
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: qa-test-suite/target/surefire-reports/
+          retention-days: 14
+
+  # ===========================================================================
+  # E2E Tests - Full service testing
+  # ===========================================================================
+  e2e-tests:
+    name: 🚀 E2E Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.test_mode == 'e2e')
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+      localstack:
+        image: localstack/localstack:3.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,sqs,sns,secretsmanager
+          DEFAULT_REGION: us-west-2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Initialize LocalStack Resources
+        run: |
+          # Wait for LocalStack to be ready
+          sleep 10
+          
+          # Create SNS topics
+          aws --endpoint-url=http://localhost:4566 sns create-topic --name account-events --region us-west-2
+          aws --endpoint-url=http://localhost:4566 sns create-topic --name catalog-events --region us-west-2
+          aws --endpoint-url=http://localhost:4566 sns create-topic --name portal-events --region us-west-2
+          aws --endpoint-url=http://localhost:4566 sns create-topic --name run-events --region us-west-2
+          aws --endpoint-url=http://localhost:4566 sns create-topic --name notification-requests --region us-west-2
+          
+          # Create S3 buckets
+          aws --endpoint-url=http://localhost:4566 s3 mb s3://workflow-storage --region us-west-2
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-west-2
+
+      - name: Initialize Database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d workflow -f infrastructure/local/db-init/01-create-users-and-schemas.sql || true
+
+      - name: Build All Services
+        run: |
+          mvn -B clean package -DskipTests -T 4
+        timeout-minutes: 20
+
+      - name: Start Services (Background)
+        run: |
+          # Start core services in background
+          ./scripts/start-services.sh &
+          
+          # Wait for services to be ready
+          echo "Waiting for services to start..."
+          sleep 60
+          
+          # Health check
+          curl -f http://localhost:8087/actuator/health || echo "Catalog not ready"
+        timeout-minutes: 5
+        continue-on-error: true
+
+      - name: Build QA Test Suite
+        run: mvn -B compile test-compile -f qa-test-suite/pom.xml
+
+      - name: Run E2E Tests
+        run: |
+          mvn -B verify \
+            -f qa-test-suite/pom.xml \
+            -Pe2e \
+            -Dqa.services.base-url=http://localhost \
+            -Dqa.timeout.seconds=60
+        timeout-minutes: 30
+
+      - name: Generate Coverage Report
+        run: mvn -B jacoco:report -f qa-test-suite/pom.xml
+        if: always()
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results
+          path: |
+            qa-test-suite/target/surefire-reports/
+            qa-test-suite/target/failsafe-reports/
+            qa-test-suite/target/site/jacoco/
+          retention-days: 30
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'qa-test-suite/target/*-reports/TEST-*.xml'
+          fail_on_failure: false
+          summary: true
+
+  # ===========================================================================
+  # Security Tests - Auth, RBAC, and vulnerability testing
+  # ===========================================================================
+  security-tests:
+    name: 🔐 Security Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.test_mode == 'security' || github.event.inputs.test_mode == 'all')
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build QA Test Suite
+        run: mvn -B compile test-compile -f qa-test-suite/pom.xml
+
+      - name: Run Security Tests
+        run: |
+          mvn -B verify \
+            -f qa-test-suite/pom.xml \
+            -Dgroups=security \
+            -Dqa.services.base-url=http://localhost \
+            -Dqa.timeout.seconds=30
+        timeout-minutes: 15
+
+      - name: Upload Security Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-test-results
+          path: |
+            qa-test-suite/target/surefire-reports/
+            qa-test-suite/target/failsafe-reports/
+          retention-days: 30
+
+      - name: Publish Security Test Report
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'qa-test-suite/target/*-reports/TEST-*.xml'
+          fail_on_failure: true
+          summary: true
+          check_name: Security Tests
+
+  # ===========================================================================
+  # Tenant Isolation Tests - Cross-tenant security
+  # ===========================================================================
+  tenant-isolation-tests:
+    name: 🏢 Tenant Isolation Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.test_mode == 'tenant-isolation' || github.event.inputs.test_mode == 'all')
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build QA Test Suite
+        run: mvn -B compile test-compile -f qa-test-suite/pom.xml
+
+      - name: Run Tenant Isolation Tests
+        run: |
+          mvn -B verify \
+            -f qa-test-suite/pom.xml \
+            -Dgroups=tenant-isolation \
+            -Dqa.services.base-url=http://localhost \
+            -Dqa.timeout.seconds=30
+        timeout-minutes: 15
+
+      - name: Upload Tenant Isolation Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tenant-isolation-results
+          path: |
+            qa-test-suite/target/surefire-reports/
+            qa-test-suite/target/failsafe-reports/
+          retention-days: 30
+
+      - name: Publish Tenant Isolation Report
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'qa-test-suite/target/*-reports/TEST-*.xml'
+          fail_on_failure: true
+          summary: true
+          check_name: Tenant Isolation Tests
+
+  # ===========================================================================
+  # Load Tests - Performance and stress testing with k6
+  # ===========================================================================
+  load-tests:
+    name: 📈 Load Tests
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      github.event.inputs.test_mode == 'load'
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Build and Start Services
+        run: |
+          mvn -B clean package -DskipTests -T 4
+          ./scripts/start-services.sh &
+          sleep 60
+        timeout-minutes: 25
+
+      - name: Run Gateway Load Tests
+        run: |
+          k6 run qa-test-suite/scripts/load-tests/gateway-load-test.js \
+            --env BASE_URL=http://localhost:8080 \
+            --env TENANT_ID=${{ secrets.TEST_TENANT_ID || 'test-tenant' }} \
+            --summary-export=gateway-load-results.json
+        timeout-minutes: 20
+        continue-on-error: true
+
+      - name: Run VoIP Load Tests
+        run: |
+          k6 run qa-test-suite/scripts/load-tests/voip-load-test.js \
+            --env BASE_URL=http://localhost:8080 \
+            --env TENANT_ID=${{ secrets.TEST_TENANT_ID || 'test-tenant' }} \
+            --summary-export=voip-load-results.json
+        timeout-minutes: 20
+        continue-on-error: true
+
+      - name: Upload Load Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-test-results
+          path: |
+            *-load-results.json
+            qa-test-suite/scripts/load-tests/
+          retention-days: 30
+
+      - name: Generate Load Test Summary
+        if: always()
+        run: |
+          echo "## 📈 Load Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f gateway-load-results.json ]; then
+            echo "### Gateway Load Test" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            cat gateway-load-results.json >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f voip-load-results.json ]; then
+            echo "### VoIP Load Test" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+            cat voip-load-results.json >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ===========================================================================
+  # Full Test Suite (All tests)
+  # ===========================================================================
+  full-test-suite:
+    name: 🏆 Full Test Suite
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_mode == 'all'
+    
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: workflow
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+      localstack:
+        image: localstack/localstack:3.0
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,sqs,sns,secretsmanager
+          DEFAULT_REGION: us-west-2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build and Test
+        run: |
+          mvn -B verify \
+            -f qa-test-suite/pom.xml \
+            -Pall \
+            -Dqa.services.base-url=http://localhost
+        timeout-minutes: 45
+
+      - name: Upload All Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-test-results
+          path: |
+            qa-test-suite/target/surefire-reports/
+            qa-test-suite/target/failsafe-reports/
+            qa-test-suite/target/site/
+          retention-days: 30
+
+  # ===========================================================================
+  # Report Summary
+  # ===========================================================================
+  report-summary:
+    name: 📊 Test Report Summary
+    runs-on: ubuntu-latest
+    needs: [smoke-tests, integration-tests, e2e-tests, security-tests, tenant-isolation-tests, load-tests, full-test-suite]
+    if: always()
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: test-results
+
+      - name: Generate Summary Report
+        run: |
+          echo "## 🧪 QA Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Check each job result
+          if [ "${{ needs.smoke-tests.result }}" == "success" ]; then
+            echo "| Smoke Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.smoke-tests.result }}" == "failure" ]; then
+            echo "| Smoke Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Smoke Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.integration-tests.result }}" == "success" ]; then
+            echo "| Integration Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.integration-tests.result }}" == "failure" ]; then
+            echo "| Integration Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Integration Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.e2e-tests.result }}" == "success" ]; then
+            echo "| E2E Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.e2e-tests.result }}" == "failure" ]; then
+            echo "| E2E Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| E2E Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.security-tests.result }}" == "success" ]; then
+            echo "| 🔐 Security Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.security-tests.result }}" == "failure" ]; then
+            echo "| 🔐 Security Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔐 Security Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.tenant-isolation-tests.result }}" == "success" ]; then
+            echo "| 🏢 Tenant Isolation | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.tenant-isolation-tests.result }}" == "failure" ]; then
+            echo "| 🏢 Tenant Isolation | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🏢 Tenant Isolation | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.load-tests.result }}" == "success" ]; then
+            echo "| 📈 Load Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.load-tests.result }}" == "failure" ]; then
+            echo "| 📈 Load Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 📈 Load Tests | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.full-test-suite.result }}" == "success" ]; then
+            echo "| Full Suite | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.full-test-suite.result }}" == "failure" ]; then
+            echo "| Full Suite | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Full Suite | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📅 Run triggered by: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

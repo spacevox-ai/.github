@@ -1,0 +1,375 @@
+# ==============================================================================
+# SpaceVox Monolith - Production Deployment Pipeline
+# ==============================================================================
+# 
+# Builds and deploys the monolith to production (EC2 instance with Docker).
+# 
+# Triggers:
+#   - Push to production branch
+#   - Manual workflow dispatch with approval
+#
+# Flow:
+#   1. Build monolith JAR (all 17 Spring Boot services)
+#   2. Build Docker image
+#   3. Push to ECR with :production and :vX.Y.Z tags
+#   4. Deploy to EC2 via docker pull + restart
+#
+# ==============================================================================
+
+name: Deploy Monolith (Production)
+
+on:
+  push:
+    branches:
+      - production
+    paths:
+      - 'spacevox-monolith/**'
+      - 'base-*/**'
+      - 'account/**'
+      - 'catalog/**'
+      - 'config/**'
+      - 'connection/**'
+      - 'portal/**'
+      - 'run/**'
+      - 'storage/**'
+      - 'subscription/**'
+      - 'task/**'
+      - 'trigger/**'
+      - 'webhook/**'
+      - 'insights/**'
+      - 'notification/**'
+      - 'ai-runtime/**'
+      - 'studio-management/**'
+      - 'kb-worker/**'
+      - 'workflow-gateway/**'
+  
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (not recommended for production)'
+        required: false
+        default: 'false'
+        type: boolean
+      version_tag:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: false
+        type: string
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: '646966486018'
+  ECR_REGISTRY: 646966486018.dkr.ecr.us-west-2.amazonaws.com
+  ECR_MONOLITH: spacevox/monolith
+  ECR_WORKFLOW_ENGINE: spacevox/workflow-engine
+  ECR_DATAPLANE_AGENT: spacevox/dataplane-agent
+  ECR_EMBEDDING_SERVICE: spacevox/embedding-service
+  EC2_INSTANCE_ID: 'i-097c342f42e804775'
+  JAVA_VERSION: '21'
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  # ===========================================================================
+  # Pre-flight Checks
+  # ===========================================================================
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version_tag }}" ]; then
+            VERSION="${{ inputs.version_tag }}"
+          else
+            # Auto-generate version from date and short SHA
+            VERSION="v$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "🏷️ Deploying version: $VERSION"
+
+      - name: Verify Production Branch
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/production" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "❌ Production deploys must come from production branch"
+            exit 1
+          fi
+          echo "✅ Branch verification passed"
+
+  # ===========================================================================
+  # Build Base Modules
+  # ===========================================================================
+  build-base:
+    needs: preflight
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Build Base Modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📦 Building base modules..."
+          for module in base-common base-multi-tenant base-rls base-ai-common base-secret-store base-http base-conversation base-api-contracts base-tool-execution base-tool-execution-impl base-data-exchange base-mcp base-test-utils base-dataplane-common; do
+            if [ -d "$module" ]; then
+              echo "  → Building $module"
+              cd $module
+              mvn -B clean install -DskipTests -Dmaven.javadoc.skip=true -q
+              cd ..
+            fi
+          done
+          echo "✅ Base modules built"
+
+      - name: Upload Base Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-modules
+          path: ~/.m2/repository/com/svai/
+          retention-days: 1
+
+  # ===========================================================================
+  # Build Services
+  # ===========================================================================
+  build-services:
+    needs: build-base
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Download Base Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: base-modules
+          path: ~/.m2/repository/com/svai/
+
+      - name: Build Services
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📦 Building services..."
+          for service in account catalog config connection portal run storage subscription task trigger webhook insights notification ai-runtime studio-management kb-worker workflow-gateway; do
+            if [ -d "$service" ]; then
+              echo "  → Building $service"
+              cd $service
+              mvn -B clean install -DskipTests -Dmaven.javadoc.skip=true -q
+              cd ..
+            fi
+          done
+          echo "✅ Services built"
+
+      - name: Upload Service Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-modules
+          path: ~/.m2/repository/com/svai/
+          retention-days: 1
+
+  # ===========================================================================
+  # Build Monolith JAR
+  # ===========================================================================
+  build-monolith:
+    needs: build-services
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Download Service Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: service-modules
+          path: ~/.m2/repository/com/svai/
+
+      - name: Build Monolith
+        working-directory: spacevox-monolith
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "📦 Building monolith..."
+          if [ "${{ inputs.skip_tests }}" == "true" ]; then
+            mvn -B clean package -DskipTests -Dmaven.javadoc.skip=true
+          else
+            mvn -B clean package -Dmaven.javadoc.skip=true
+          fi
+          echo "✅ Monolith built"
+          ls -la target/*.jar
+
+      - name: Upload Monolith JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: monolith-jar
+          path: spacevox-monolith/target/*.jar
+          retention-days: 1
+
+  # ===========================================================================
+  # Build & Push Docker Image
+  # ===========================================================================
+  docker-build:
+    needs: [preflight, build-monolith]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Monolith JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: monolith-jar
+          path: spacevox-monolith/target/
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        working-directory: spacevox-monolith
+        run: |
+          VERSION="${{ needs.preflight.outputs.version }}"
+          
+          echo "🐳 Building Docker image..."
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:$VERSION .
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:$VERSION \
+                     ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:production
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:$VERSION \
+                     ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:latest
+          
+          echo "📤 Pushing to ECR..."
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:$VERSION
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:production
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:latest
+          
+          echo "✅ Image pushed: ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:$VERSION"
+
+  # ===========================================================================
+  # Deploy to EC2
+  # ===========================================================================
+  deploy:
+    needs: [preflight, docker-build]
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to EC2
+        run: |
+          VERSION="${{ needs.preflight.outputs.version }}"
+          INSTANCE_ID="${{ env.EC2_INSTANCE_ID }}"
+          
+          echo "🚀 Deploying $VERSION to production EC2..."
+          
+          # Send SSM command to pull and restart
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "echo Deploying version: '"$VERSION"'",
+              "aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}",
+              "docker pull ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:'"$VERSION"'",
+              "docker stop spacevox-monolith 2>/dev/null || true",
+              "docker rm spacevox-monolith 2>/dev/null || true",
+              "docker run -d --name spacevox-monolith --network spacevox-net --restart unless-stopped --memory 4g --cpus 2 -p 8080:8080 -p 9090:9090 --env-file /opt/spacevox/config/monolith.env -v /opt/spacevox/logs/monolith:/app/logs ${{ env.ECR_REGISTRY }}/${{ env.ECR_MONOLITH }}:'"$VERSION"'",
+              "docker image prune -f",
+              "echo Deploy completed: '"$VERSION"'"
+            ]' \
+            --output text \
+            --query "Command.CommandId")
+          
+          echo "⏳ Waiting for deployment to complete..."
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID"
+          
+          echo "✅ Deployment completed"
+
+      - name: Verify Deployment
+        run: |
+          HEALTH_URL="https://api.work.studio/actuator/health"
+          
+          echo "🔍 Verifying deployment health..."
+          for i in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$STATUS" == "200" ]; then
+              echo "✅ Application is healthy!"
+              exit 0
+            fi
+            echo "  Attempt $i/30: Status $STATUS, waiting..."
+            sleep 10
+          done
+          
+          echo "❌ Health check failed after 5 minutes"
+          exit 1
+
+  # ===========================================================================
+  # Notify
+  # ===========================================================================
+  notify:
+    needs: [preflight, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Notify Success
+        if: ${{ needs.deploy.result == 'success' }}
+        run: |
+          echo "🎉 Production deployment successful!"
+          echo "Version: ${{ needs.preflight.outputs.version }}"
+
+      - name: Notify Failure
+        if: ${{ needs.deploy.result == 'failure' }}
+        run: |
+          echo "❌ Production deployment failed!"
+          echo "Check the workflow logs for details."
+          exit 1

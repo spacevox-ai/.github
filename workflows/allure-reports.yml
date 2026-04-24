@@ -1,0 +1,214 @@
+name: Allure Test Reports
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to test (comma-separated or "all")'
+        required: true
+        default: 'all'
+        type: string
+      test_type:
+        description: 'Test type to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - unit
+          - integration
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - '*/src/**'
+      - '*/pom.xml'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  # Increased memory to prevent OOM
+  MAVEN_OPTS: '-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC'
+
+jobs:
+  test-and-report:
+    name: Test & Generate Allure Report
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        service: 
+          - catalog
+          - account
+          - subscription
+          - connection
+          - run
+          - storage
+          - trigger
+          - webhook
+          - notification
+          - config
+          - task
+          - portal
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: 'maven'
+      
+      - name: Start Test Infrastructure
+        run: |
+          # Start PostgreSQL with pgvector
+          docker run -d --name postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=testdb \
+            -p 5432:5432 \
+            pgvector/pgvector:pg16
+          
+          # Start Redis
+          docker run -d --name redis \
+            -p 6379:6379 \
+            redis:7-alpine
+          
+          # Wait for services
+          sleep 10
+      
+      - name: Run Tests for ${{ matrix.service }}
+        working-directory: ${{ matrix.service }}
+        run: |
+          mvn clean verify -Dspring.profiles.active=test
+        continue-on-error: true
+      
+      - name: Generate Allure Report
+        if: always()
+        working-directory: ${{ matrix.service }}
+        run: mvn allure:report
+      
+      - name: Upload Allure Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-${{ matrix.service }}
+          path: ${{ matrix.service }}/target/allure-results/
+          retention-days: 30
+      
+      - name: Upload Allure Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report-${{ matrix.service }}
+          path: ${{ matrix.service }}/target/allure-report/
+          retention-days: 30
+      
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.service }}
+          path: |
+            ${{ matrix.service }}/target/surefire-reports/
+            ${{ matrix.service }}/target/failsafe-reports/
+          retention-days: 30
+
+  aggregate-and-publish:
+    name: Aggregate Reports & Publish
+    needs: test-and-report
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download all Allure results
+        uses: actions/download-artifact@v4
+        with:
+          path: allure-results
+          pattern: allure-results-*
+          merge-multiple: true
+      
+      - name: Get Allure history
+        uses: actions/checkout@v4
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+      
+      - name: Setup Allure
+        uses: simple-elf/allure-report-action@v1.7
+        with:
+          allure_results: allure-results
+          allure_history: gh-pages/allure-history
+          keep_reports: 20
+      
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: allure-history
+          destination_dir: test-reports
+      
+      - name: Add PR Comment with Report Link
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runNumber = context.runNumber;
+            const repoUrl = context.payload.repository.html_url;
+            const reportUrl = `${repoUrl.replace('github.com', 'github.io').replace('https://', 'https://').replace(/\/[^\/]+$/, '')}/test-reports`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📊 Allure Test Report
+              
+**Test Execution Complete!**
+
+🔗 [View Full Report](${reportUrl})
+📝 Run Number: #${runNumber}
+              
+The test results have been aggregated and are available in the Allure dashboard.`
+            });
+      
+      - name: Upload Combined Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-allure-report
+          path: allure-report/
+          retention-days: 30
+
+  test-summary:
+    name: Test Execution Summary
+    needs: test-and-report
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 📊 Test Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # This will be populated by the test matrix results
+          echo "Test execution completed for all services." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📈 View detailed reports in the Artifacts section or on GitHub Pages" >> $GITHUB_STEP_SUMMARY

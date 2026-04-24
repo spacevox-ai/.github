@@ -1,0 +1,374 @@
+# ==============================================================================
+# SpaceVox Quarkus Services - Production Deployment Pipeline
+# ==============================================================================
+# 
+# Builds and deploys Quarkus services to production (EC2 instance with Docker).
+# 
+# Services:
+#   - workflow-engine (port 9095)
+#   - dataplane-agent (port 8094)
+#   - embedding-service (port 8100)
+#
+# ==============================================================================
+
+name: Deploy Quarkus Services (Production)
+
+on:
+  push:
+    branches:
+      - production
+    paths:
+      - 'workflow-engine/**'
+      - 'dataplane-agent/**'
+      - 'embedding-service/**'
+      - 'base-*/**'
+  
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated or "all")'
+        required: false
+        default: 'all'
+        type: string
+      version_tag:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: false
+        type: string
+
+concurrency:
+  group: production-quarkus-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: '646966486018'
+  ECR_REGISTRY: 646966486018.dkr.ecr.us-west-2.amazonaws.com
+  EC2_INSTANCE_ID: 'i-097c342f42e804775'
+  JAVA_VERSION: '21'
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  # ===========================================================================
+  # Determine Services and Version
+  # ===========================================================================
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      services: ${{ steps.services.outputs.list }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version_tag }}" ]; then
+            VERSION="${{ inputs.version_tag }}"
+          else
+            VERSION="v$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "🏷️ Version: $VERSION"
+
+      - name: Determine Services
+        id: services
+        run: |
+          INPUT="${{ inputs.services }}"
+          if [ -z "$INPUT" ] || [ "$INPUT" == "all" ]; then
+            SERVICES="workflow-engine,dataplane-agent,embedding-service"
+          else
+            SERVICES="$INPUT"
+          fi
+          echo "list=$SERVICES" >> $GITHUB_OUTPUT
+          echo "📦 Services: $SERVICES"
+
+  # ===========================================================================
+  # Build Base Modules
+  # ===========================================================================
+  build-base:
+    needs: setup
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Build Base Modules
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for module in base-common base-multi-tenant base-rls base-ai-common base-secret-store base-http base-conversation base-api-contracts base-tool-execution base-tool-execution-impl base-data-exchange base-mcp base-dataplane-common; do
+            if [ -d "$module" ]; then
+              echo "Building $module..."
+              cd $module && mvn -B clean install -DskipTests -q && cd ..
+            fi
+          done
+
+      - name: Upload Base Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-modules-quarkus
+          path: ~/.m2/repository/com/svai/
+          retention-days: 1
+
+  # ===========================================================================
+  # Build & Push Workflow Engine
+  # ===========================================================================
+  build-workflow-engine:
+    needs: [setup, build-base]
+    if: ${{ contains(needs.setup.outputs.services, 'workflow-engine') }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Download Base Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: base-modules-quarkus
+          path: ~/.m2/repository/com/svai/
+
+      - name: Build Workflow Engine
+        working-directory: workflow-engine
+        run: |
+          mvn -B clean package -DskipTests -Dquarkus.package.type=fast-jar
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        working-directory: workflow-engine
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          docker build -t ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:$VERSION .
+          docker tag ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:$VERSION \
+                     ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:latest
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:$VERSION
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:latest
+          echo "✅ workflow-engine:$VERSION pushed"
+
+  # ===========================================================================
+  # Build & Push Dataplane Agent
+  # ===========================================================================
+  build-dataplane-agent:
+    needs: [setup, build-base]
+    if: ${{ contains(needs.setup.outputs.services, 'dataplane-agent') }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Download Base Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: base-modules-quarkus
+          path: ~/.m2/repository/com/svai/
+
+      - name: Build Dataplane Agent
+        working-directory: dataplane-agent
+        run: |
+          mvn -B clean package -DskipTests -Dquarkus.package.type=fast-jar
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        working-directory: dataplane-agent
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          docker build -t ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:$VERSION .
+          docker tag ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:$VERSION \
+                     ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:latest
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:$VERSION
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:latest
+          echo "✅ dataplane-agent:$VERSION pushed"
+
+  # ===========================================================================
+  # Build & Push Embedding Service
+  # ===========================================================================
+  build-embedding-service:
+    needs: [setup, build-base]
+    if: ${{ contains(needs.setup.outputs.services, 'embedding-service') }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Download Base Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: base-modules-quarkus
+          path: ~/.m2/repository/com/svai/
+
+      - name: Build Embedding Service
+        working-directory: embedding-service
+        run: |
+          mvn -B clean package -DskipTests -Dquarkus.package.type=fast-jar
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Docker Image
+        working-directory: embedding-service
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          docker build -t ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:$VERSION .
+          docker tag ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:$VERSION \
+                     ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:latest
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:$VERSION
+          docker push ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:latest
+          echo "✅ embedding-service:$VERSION pushed"
+
+  # ===========================================================================
+  # Deploy All Services to EC2
+  # ===========================================================================
+  deploy:
+    needs: [setup, build-workflow-engine, build-dataplane-agent, build-embedding-service]
+    if: ${{ always() && !cancelled() && (needs.build-workflow-engine.result == 'success' || needs.build-dataplane-agent.result == 'success' || needs.build-embedding-service.result == 'success') }}
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to EC2
+        run: |
+          VERSION="${{ needs.setup.outputs.version }}"
+          SERVICES="${{ needs.setup.outputs.services }}"
+          
+          echo "🚀 Deploying Quarkus services: $SERVICES"
+          
+          COMMANDS="echo Deploying version: $VERSION
+          aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}"
+          
+          if echo "$SERVICES" | grep -q "workflow-engine"; then
+            COMMANDS="$COMMANDS
+          docker pull ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:$VERSION
+          docker stop workflow-engine 2>/dev/null || true
+          docker rm workflow-engine 2>/dev/null || true
+          docker run -d --name workflow-engine --network spacevox-net --restart unless-stopped --memory 2g --cpus 1 -p 9095:9095 --env-file /opt/spacevox/config/workflow-engine.env -v /opt/spacevox/logs/workflow-engine:/app/logs ${{ env.ECR_REGISTRY }}/spacevox/workflow-engine:$VERSION"
+          fi
+          
+          if echo "$SERVICES" | grep -q "dataplane-agent"; then
+            COMMANDS="$COMMANDS
+          docker pull ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:$VERSION
+          docker stop dataplane-agent 2>/dev/null || true
+          docker rm dataplane-agent 2>/dev/null || true
+          docker run -d --name dataplane-agent --network spacevox-net --restart unless-stopped --memory 1g --cpus 0.5 -p 8094:8094 --env-file /opt/spacevox/config/dataplane-agent.env -v /opt/spacevox/logs/dataplane-agent:/app/logs ${{ env.ECR_REGISTRY }}/spacevox/dataplane-agent:$VERSION"
+          fi
+          
+          if echo "$SERVICES" | grep -q "embedding-service"; then
+            COMMANDS="$COMMANDS
+          docker pull ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:$VERSION
+          docker stop embedding-service 2>/dev/null || true
+          docker rm embedding-service 2>/dev/null || true
+          docker run -d --name embedding-service --network spacevox-net --restart unless-stopped --memory 2g --cpus 1 -p 8100:8100 --env-file /opt/spacevox/config/embedding-service.env -v /opt/spacevox/logs/embedding-service:/app/logs -v /opt/spacevox/models:/app/.djl.ai ${{ env.ECR_REGISTRY }}/spacevox/embedding-service:$VERSION"
+          fi
+          
+          COMMANDS="$COMMANDS
+          docker image prune -f
+          echo Deploy completed: $VERSION"
+          
+          # Convert to JSON array format for SSM
+          COMMANDS_JSON=$(echo "$COMMANDS" | jq -R -s 'split("\n") | map(select(length > 0))')
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=$COMMANDS_JSON" \
+            --output text \
+            --query "Command.CommandId")
+          
+          echo "⏳ Waiting for deployment..."
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}"
+          
+          echo "✅ Deployment completed"
+
+      - name: Health Checks
+        run: |
+          SERVICES="${{ needs.setup.outputs.services }}"
+          
+          echo "🔍 Running health checks..."
+          sleep 30  # Wait for services to start
+          
+          if echo "$SERVICES" | grep -q "workflow-engine"; then
+            for i in {1..10}; do
+              # Check via SSM since it's on private network
+              RESULT=$(aws ssm send-command \
+                --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+                --document-name "AWS-RunShellScript" \
+                --parameters 'commands=["curl -s -o /dev/null -w \"%{http_code}\" http://localhost:9095/q/health"]' \
+                --output text \
+                --query "Command.CommandId")
+              sleep 3
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$RESULT" \
+                --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+                --query "StandardOutputContent" \
+                --output text 2>/dev/null | tr -d '\n')
+              if [ "$STATUS" == "200" ]; then
+                echo "✅ workflow-engine healthy"
+                break
+              fi
+              sleep 5
+            done
+          fi
+          
+          echo "✅ Health checks completed"
