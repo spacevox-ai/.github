@@ -37,7 +37,7 @@ on:
     secrets:
       PACKAGES_TOKEN:
         description: 'GitHub PAT for accessing GitHub Packages'
-        required: true
+        required: false
       AWS_ROLE_ARN_DEV:
         description: 'AWS IAM Role ARN for dev environment'
         required: false
