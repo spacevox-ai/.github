@@ -1,0 +1,176 @@
+# ==============================================================================
+# Deploy All Services - One-Click Orchestration
+# ==============================================================================
+# Triggers deployment workflows across ALL repos
+# Usage: Run manually from GitHub Actions UI
+# ==============================================================================
+
+name: 🚀 Deploy All
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - production
+      services:
+        description: 'What to deploy'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - backends-only
+          - frontends-only
+          - libraries-only
+      dry-run:
+        description: 'Dry run (show what would be deployed)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GH_TOKEN: ${{ secrets.DEPLOY_ALL_PAT }}
+
+jobs:
+  # ===========================================================================
+  # Prepare deployment matrix
+  # ===========================================================================
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      backend-repos: ${{ steps.repos.outputs.backends }}
+      frontend-repos: ${{ steps.repos.outputs.frontends }}
+      library-repos: ${{ steps.repos.outputs.libraries }}
+      target-branch: ${{ steps.repos.outputs.branch }}
+    steps:
+      - name: Determine target branch
+        id: repos
+        run: |
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            echo "branch=production" >> $GITHUB_OUTPUT
+          else
+            echo "branch=main" >> $GITHUB_OUTPUT
+          fi
+          
+          # Backend services (Java → Docker → EC2)
+          echo 'backends=["account","catalog","config","connection","embedding-service","insights","kb-worker","notification","portal","run","storage","studio-management","subscription","task","trigger","webhook","workflow-engine","workflow-gateway","ai-runtime","voip-gateway","speech-service","code-sync-worker","intent-compiler","spacevox-monolith"]' >> $GITHUB_OUTPUT
+          
+          # Frontend apps (Node.js → S3)
+          echo 'frontends=["designer","work-studio","admin-ui"]' >> $GITHUB_OUTPUT
+          
+          # Libraries (build & publish to GitHub Packages)
+          echo 'libraries=["base-common","base-api-contracts","base-http","base-multi-tenant","base-rls","base-ai-common","base-mcp","base-tool-execution","base-conversation","base-data-exchange","base-dataplane-common","base-secret-store","base-test-utils","base-tool-execution-impl"]' >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Deploy All - ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Branch:** \`${{ steps.repos.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Services:** ${{ inputs.services }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry Run:** ${{ inputs.dry-run }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy Libraries First (dependencies)
+  # ===========================================================================
+  deploy-libraries:
+    name: Libraries
+    needs: prepare
+    if: inputs.services == 'all' || inputs.services == 'libraries-only'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        repo: ${{ fromJson(needs.prepare.outputs.library-repos) }}
+    steps:
+      - name: Trigger ${{ matrix.repo }}
+        if: inputs.dry-run == false
+        run: |
+          echo "📦 Triggering ${{ matrix.repo }}..."
+          gh workflow run deploy.yml \
+            --repo spacevox-ai/${{ matrix.repo }} \
+            --ref ${{ needs.prepare.outputs.target-branch }} || echo "⚠️ Failed or no workflow"
+      
+      - name: Dry run - ${{ matrix.repo }}
+        if: inputs.dry-run == true
+        run: echo "Would trigger spacevox-ai/${{ matrix.repo }} on ${{ needs.prepare.outputs.target-branch }}"
+
+  # ===========================================================================
+  # Deploy Backend Services
+  # ===========================================================================
+  deploy-backends:
+    name: Backends
+    needs: [prepare, deploy-libraries]
+    if: (inputs.services == 'all' || inputs.services == 'backends-only') && always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        repo: ${{ fromJson(needs.prepare.outputs.backend-repos) }}
+    steps:
+      - name: Trigger ${{ matrix.repo }}
+        if: inputs.dry-run == false
+        run: |
+          echo "🔧 Triggering ${{ matrix.repo }}..."
+          gh workflow run deploy.yml \
+            --repo spacevox-ai/${{ matrix.repo }} \
+            --ref ${{ needs.prepare.outputs.target-branch }} || echo "⚠️ Failed or no workflow"
+      
+      - name: Dry run - ${{ matrix.repo }}
+        if: inputs.dry-run == true
+        run: echo "Would trigger spacevox-ai/${{ matrix.repo }} on ${{ needs.prepare.outputs.target-branch }}"
+
+  # ===========================================================================
+  # Deploy Frontend Apps
+  # ===========================================================================
+  deploy-frontends:
+    name: Frontends
+    needs: [prepare, deploy-backends]
+    if: (inputs.services == 'all' || inputs.services == 'frontends-only') && always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.prepare.outputs.frontend-repos) }}
+    steps:
+      - name: Trigger ${{ matrix.repo }}
+        if: inputs.dry-run == false
+        run: |
+          echo "🎨 Triggering ${{ matrix.repo }}..."
+          gh workflow run deploy.yml \
+            --repo spacevox-ai/${{ matrix.repo }} \
+            --ref ${{ needs.prepare.outputs.target-branch }} || echo "⚠️ Failed or no workflow"
+      
+      - name: Dry run - ${{ matrix.repo }}
+        if: inputs.dry-run == true
+        run: echo "Would trigger spacevox-ai/${{ matrix.repo }} on ${{ needs.prepare.outputs.target-branch }}"
+
+  # ===========================================================================
+  # Summary
+  # ===========================================================================
+  summary:
+    name: Deployment Summary
+    needs: [prepare, deploy-libraries, deploy-backends, deploy-frontends]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## ✅ Deployment Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Libraries | ${{ needs.deploy-libraries.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backends | ${{ needs.deploy-backends.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontends | ${{ needs.deploy-frontends.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check individual repo Actions for deployment status." >> $GITHUB_STEP_SUMMARY
