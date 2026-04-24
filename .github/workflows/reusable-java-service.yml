@@ -105,13 +105,16 @@ jobs:
         run: |
           mkdir -p ~/.m2
           TOKEN="${{ secrets.PACKAGES_TOKEN }}"
+          echo "PACKAGES_TOKEN available: $([ -n \"$TOKEN\" ] && echo 'YES' || echo 'NO')"
           if [ -z "$TOKEN" ]; then
+            echo "::warning::PACKAGES_TOKEN not available, falling back to GITHUB_TOKEN"
             TOKEN="${{ secrets.GITHUB_TOKEN }}"
           fi
           cat > ~/.m2/settings.xml << EOF
           <settings>
             <servers>
               <server><id>github</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-packages</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-common</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-http</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
@@ -123,6 +126,7 @@ jobs:
               <server><id>github-base-test-utils</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-mcp</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-tool-execution</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-tool-execution-impl</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-dataplane-common</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
               <server><id>github-base-conversation</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
             </servers>
