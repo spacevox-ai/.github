@@ -130,6 +130,9 @@ jobs:
     if: needs.setup.outputs.should-deploy == 'true'
     runs-on: ubuntu-latest
     environment: ${{ needs.setup.outputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
     
     steps:
       - name: Checkout
