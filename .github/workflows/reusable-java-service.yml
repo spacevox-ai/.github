@@ -100,11 +100,34 @@ jobs:
           java-version: ${{ inputs.java-version }}
           distribution: 'temurin'
           cache: 'maven'
-          server-id: github
-          server-username: GITHUB_ACTOR
-          server-password: PACKAGES_TOKEN
-        env:
-          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+
+      - name: Configure Maven (GitHub Packages with all repos)
+        run: |
+          mkdir -p ~/.m2
+          TOKEN="${{ secrets.PACKAGES_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          fi
+          cat > ~/.m2/settings.xml << EOF
+          <settings>
+            <servers>
+              <server><id>github</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-common</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-multi-tenant</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-http</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-api-contracts</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-data-exchange</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-rls</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-ai-common</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-secret-store</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-test-utils</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-mcp</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-tool-execution</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-dataplane-common</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+              <server><id>github-base-conversation</id><username>${{ github.actor }}</username><password>$TOKEN</password></server>
+            </servers>
+          </settings>
+          EOF
 
       - name: Build & Test
         id: build
