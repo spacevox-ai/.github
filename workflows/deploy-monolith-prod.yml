@@ -327,8 +327,8 @@ jobs:
       - name: Fresh Install - Upload Keycloak Realms to S3
         if: ${{ needs.preflight.outputs.fresh_install == 'true' }}
         run: |
-          # Bucket follows terraform naming: {project}-{env}-storage-{account_id}
-          S3_BUCKET="spacevox-production-storage-${{ env.AWS_ACCOUNT_ID }}"
+          # Use workflow-artifacts bucket for deployment files
+          S3_BUCKET="spacevox-production-workflow-artifacts"
           
           echo "📦 Uploading Keycloak realm files to S3 bucket: $S3_BUCKET"
           aws s3 cp infrastructure/local/keycloak/realms/integration_platform-realm.json \
@@ -342,7 +342,7 @@ jobs:
         run: |
           VERSION="${{ needs.preflight.outputs.version }}"
           INSTANCE_ID="${{ env.EC2_INSTANCE_ID }}"
-          S3_BUCKET="spacevox-production-storage-${{ env.AWS_ACCOUNT_ID }}"
+          S3_BUCKET="spacevox-production-workflow-artifacts"
           
           echo "🗑️ FRESH INSTALL: Resetting database and deploying $VERSION..."
           
