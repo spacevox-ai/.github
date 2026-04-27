@@ -76,7 +76,7 @@ jobs:
             echo "environment=dev"
             echo "should-deploy=true"
             echo "aws-account-id=109958268025"
-            echo "ec2-instance-id=i-0dev12345678"
+            echo "ec2-instance-id=i-035c3a4bc73329e51"
           else
             echo "environment=ci"
             echo "should-deploy=false"
@@ -180,8 +180,20 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Check for Dockerfile
+        id: check-dockerfile
+        run: |
+          if [ -f "Dockerfile" ]; then
+            echo "has-dockerfile=true" >> $GITHUB_OUTPUT
+            echo "✅ Dockerfile found - will build Docker image"
+          else
+            echo "has-dockerfile=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No Dockerfile - service is part of monolith, skipping Docker build"
+          fi
+
       - name: Build & Push Docker Image
         id: docker
+        if: steps.check-dockerfile.outputs.has-dockerfile == 'true'
         run: |
           ACCOUNT_ID="${{ needs.setup.outputs.aws-account-id }}"
           IMAGE="$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/spacevox/${{ inputs.service-name }}"
@@ -195,7 +207,7 @@ jobs:
           echo "image=$IMAGE:${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Deploy to EC2 (docker-compose)
-        if: inputs.deploy-target == 'ec2-monolith'
+        if: inputs.deploy-target == 'ec2-monolith' && steps.check-dockerfile.outputs.has-dockerfile == 'true'
         run: |
           INSTANCE_ID="${{ needs.setup.outputs.ec2-instance-id }}"
           SERVICE="${{ inputs.service-name }}"
@@ -221,11 +233,18 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## 🚀 Deployed ${{ inputs.service-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 🏗️ Build: ${{ inputs.service-name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Service** | ${{ inputs.service-name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Environment** | ${{ needs.setup.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | ${{ steps.docker.outputs.image }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check-dockerfile.outputs.has-dockerfile }}" == "true" ]; then
+            echo "| **Image** | ${{ steps.docker.outputs.image }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Deployment** | Docker image pushed to ECR |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Deployment** | ⚠️ Skipped - service is part of monolith |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> **Note:** This service doesn't have a Dockerfile. It will be deployed as part of the **spacevox-monolith** via the [deploy-monolith-prod workflow](https://github.com/spacevox-ai/spacevox-monolith/actions)." >> $GITHUB_STEP_SUMMARY
+          fi
           echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
