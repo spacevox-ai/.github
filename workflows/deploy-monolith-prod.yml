@@ -48,12 +48,17 @@ on:
       skip_tests:
         description: 'Skip tests (not recommended for production)'
         required: false
-        default: 'false'
+        default: false
         type: boolean
       version_tag:
         description: 'Version tag (e.g., v1.0.0)'
         required: false
         type: string
+      fresh_install:
+        description: '⚠️ FRESH INSTALL: Drops ALL data (DB schemas, Keycloak)'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: production-deploy
@@ -84,11 +89,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      fresh_install: ${{ steps.check_fresh.outputs.fresh_install }}
     
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Check Fresh Install Flag
+        id: check_fresh
+        run: |
+          FRESH="${{ inputs.fresh_install }}"
+          echo "fresh_install=${FRESH:-false}" >> $GITHUB_OUTPUT
+          if [ "$FRESH" == "true" ]; then
+            echo "⚠️ FRESH INSTALL ENABLED - ALL DATA WILL BE DELETED!"
+            echo "⚠️ This includes: all wf_* schemas, keycloak schema, admin schema"
+          fi
 
       - name: Determine Version
         id: version
@@ -297,18 +313,157 @@ jobs:
     environment: production
     
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            infrastructure/local/keycloak/realms
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to EC2
+      - name: Fresh Install - Upload Keycloak Realms to S3
+        if: ${{ needs.preflight.outputs.fresh_install == 'true' }}
+        run: |
+          # Bucket follows terraform naming: {project}-{env}-storage-{account_id}
+          S3_BUCKET="spacevox-production-storage-${{ env.AWS_ACCOUNT_ID }}"
+          
+          echo "📦 Uploading Keycloak realm files to S3 bucket: $S3_BUCKET"
+          aws s3 cp infrastructure/local/keycloak/realms/integration_platform-realm.json \
+            "s3://${S3_BUCKET}/keycloak/realms/integration_platform-realm.json"
+          aws s3 cp infrastructure/local/keycloak/realms/spacevox-admin-realm.json \
+            "s3://${S3_BUCKET}/keycloak/realms/spacevox-admin-realm.json"
+          echo "✅ Keycloak realms uploaded"
+
+      - name: Fresh Install - Reset Database & Deploy via Docker Compose
+        if: ${{ needs.preflight.outputs.fresh_install == 'true' }}
+        run: |
+          VERSION="${{ needs.preflight.outputs.version }}"
+          INSTANCE_ID="${{ env.EC2_INSTANCE_ID }}"
+          S3_BUCKET="spacevox-production-storage-${{ env.AWS_ACCOUNT_ID }}"
+          
+          echo "🗑️ FRESH INSTALL: Resetting database and deploying $VERSION..."
+          
+          # SSM command for fresh install
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 900 \
+            --parameters 'commands=[
+              "set -e",
+              "echo ========================================",
+              "echo FRESH INSTALL - Resetting everything",
+              "echo ========================================",
+              "",
+              "cd /opt/spacevox",
+              "S3_BUCKET='"${S3_BUCKET}"'",
+              "",
+              "# 1. Stop all containers",
+              "echo Step 1/8: Stopping all containers...",
+              "docker-compose down --remove-orphans 2>/dev/null || true",
+              "docker stop $(docker ps -q) 2>/dev/null || true",
+              "",
+              "# 2. Download fresh configs from S3",
+              "echo Step 2/8: Downloading configs from S3...",
+              "mkdir -p /opt/spacevox/keycloak/realms",
+              "aws s3 cp \"s3://$S3_BUCKET/keycloak/realms/\" /opt/spacevox/keycloak/realms/ --recursive",
+              "aws s3 cp \"s3://$S3_BUCKET/ec2-config/docker-compose.yml\" /opt/spacevox/docker-compose.yml",
+              "aws s3 cp \"s3://$S3_BUCKET/ec2-config/db-init-monolith.sql\" /opt/spacevox/db-init-monolith.sql",
+              "",
+              "# 3. Pull latest images",
+              "echo Step 3/8: Pulling latest Docker images...",
+              "aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}",
+              "docker-compose pull || echo Pull failed, using existing images",
+              "",
+              "# 4. Load secrets from AWS Secrets Manager",
+              "echo Step 4/8: Loading secrets...",
+              "/opt/spacevox/fetch-secrets.sh || echo Secrets may already exist",
+              "",
+              "# 5. Drop all schemas (DESTRUCTIVE!)",
+              "echo Step 5/8: Dropping ALL schemas (fresh install)...",
+              "source /opt/spacevox/.env",
+              "export PGPASSWORD=\"${ADMIN_DB_PASSWORD}\"",
+              "DB_HOST=$(grep -oP \"(?<=DB_HOST=)[^\\s]+\" /opt/spacevox/base.env 2>/dev/null || echo spacevox-prod.cluster-c1su46cmsd55.us-west-2.rds.amazonaws.com)",
+              "DB_HOST=$(echo $DB_HOST | tr -d \"'\\\"\")",
+              "echo Connecting to: $DB_HOST",
+              "psql -h $DB_HOST -U spacevox_admin -d spacevox << EOSQL",
+              "DROP SCHEMA IF EXISTS keycloak CASCADE;",
+              "DROP SCHEMA IF EXISTS admin CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_account CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_catalog CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_config CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_connection CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_portal_be CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_run CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_storage CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_task CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_trigger CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_webhook CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_subscription CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_notification CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_insights CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_kb_worker CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_gateway CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_studio_mgmt CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_ai_runtime CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_vector CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_voip CASCADE;",
+              "DROP SCHEMA IF EXISTS wf_voip_runtime CASCADE;",
+              "EOSQL",
+              "echo Schemas dropped successfully",
+              "",
+              "# 6. Start services via docker-compose (includes db-init and keycloak)",
+              "echo Step 6/8: Starting services via docker-compose...",
+              "docker-compose up -d",
+              "",
+              "# 7. Wait for db-init to complete",
+              "echo Step 7/8: Waiting for db-init to complete...",
+              "sleep 45",
+              "docker-compose logs db-init",
+              "",
+              "# 8. Verify monolith is starting",
+              "echo Step 8/8: Waiting for monolith to be healthy...",
+              "for i in $(seq 1 60); do",
+              "  if curl -sf http://localhost:8080/actuator/health > /dev/null 2>&1; then",
+              "    echo Monolith is healthy!",
+              "    break",
+              "  fi",
+              "  echo Attempt $i/60 - waiting...",
+              "  sleep 10",
+              "done",
+              "",
+              "# Cleanup",
+              "docker image prune -f",
+              "",
+              "echo ========================================",
+              "echo FRESH INSTALL COMPLETE: '"$VERSION"'",
+              "echo ========================================"
+            ]' \
+            --output text \
+            --query "Command.CommandId")
+          
+          echo "⏳ Waiting for fresh install to complete (this may take 5-10 minutes)..."
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" || true
+          
+          # Get command output
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text | tail -100
+          
+          echo "✅ Fresh install deployment completed"
+
+      - name: Rolling Update - Deploy via Docker Run
+        if: ${{ needs.preflight.outputs.fresh_install != 'true' }}
         run: |
           VERSION="${{ needs.preflight.outputs.version }}"
           INSTANCE_ID="${{ env.EC2_INSTANCE_ID }}"
           
-          echo "🚀 Deploying $VERSION to production EC2..."
+          echo "🚀 Deploying $VERSION to production EC2 (rolling update)..."
           
           # Send SSM command to pull and restart
           COMMAND_ID=$(aws ssm send-command \
