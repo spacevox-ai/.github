@@ -313,10 +313,13 @@ jobs:
     environment: production
     
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout infrastructure repo (for Keycloak realms)
+        uses: actions/checkout@v4
         with:
+          repository: spacevox-ai/infrastructure
           sparse-checkout: |
-            infrastructure/local/keycloak/realms
+            local/keycloak/realms
+          path: infrastructure
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
