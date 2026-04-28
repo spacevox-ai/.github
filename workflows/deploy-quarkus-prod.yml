@@ -16,7 +16,8 @@ name: Deploy Quarkus Services (Production)
 on:
   push:
     branches:
-      - production
+      - main
+      - master
     paths:
       - 'workflow-engine/**'
       - 'dataplane-agent/**'

@@ -21,7 +21,8 @@ name: Deploy Monolith (Production)
 on:
   push:
     branches:
-      - production
+      - main
+      - master
     paths:
       - 'spacevox-monolith/**'
       - 'base-*/**'
@@ -118,13 +119,13 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "🏷️ Deploying version: $VERSION"
 
-      - name: Verify Production Branch
+      - name: Verify Branch
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/production" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo "❌ Production deploys must come from production branch"
+          if [ "${{ github.ref }}" != "refs/heads/main" ] && [ "${{ github.ref }}" != "refs/heads/master" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "❌ Production deploys must come from main/master branch"
             exit 1
           fi
-          echo "✅ Branch verification passed"
+          echo "✅ Branch verification passed (from ${{ github.ref }})"
 
   # ===========================================================================
   # Build Base Modules
