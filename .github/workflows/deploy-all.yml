@@ -52,11 +52,9 @@ jobs:
       - name: Determine target branch
         id: repos
         run: |
-          if [[ "${{ inputs.environment }}" == "production" ]]; then
-            echo "branch=production" >> $GITHUB_OUTPUT
-          else
-            echo "branch=main" >> $GITHUB_OUTPUT
-          fi
+          # Always use main branch - environment selection affects deployment target, not branch
+          # (We don't use separate production branches - main is the source of truth)
+          echo "branch=main" >> $GITHUB_OUTPUT
           
           # Backend services (Java → Docker → EC2)
           echo 'backends=["account","catalog","config","connection","embedding-service","insights","kb-worker","notification","portal","run","storage","studio-management","subscription","task","trigger","webhook","workflow-engine","workflow-gateway","ai-runtime","voip-gateway","speech-service","code-sync-worker","intent-compiler","spacevox-monolith"]' >> $GITHUB_OUTPUT
