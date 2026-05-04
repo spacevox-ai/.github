@@ -80,20 +80,14 @@ jobs:
             echo "build-command=npm run build"
             echo "cloudfront-id="
             echo "aws-account-id="
-          elif [[ "${{ github.ref }}" == "refs/heads/production" ]]; then
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # main branch deploys to production
             echo "environment=production"
             echo "should-deploy=true"
             echo "s3-bucket=${{ inputs.s3-bucket-prod }}"
             echo "build-command=${{ inputs.build-command-prod }}"
             echo "cloudfront-id=${{ inputs.cloudfront-distribution-prod }}"
             echo "aws-account-id=646966486018"
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
-            echo "environment=dev"
-            echo "should-deploy=true"
-            echo "s3-bucket=${{ inputs.s3-bucket-dev }}"
-            echo "build-command=${{ inputs.build-command-dev }}"
-            echo "cloudfront-id=${{ inputs.cloudfront-distribution-dev }}"
-            echo "aws-account-id=109958268025"
           else
             echo "environment=ci"
             echo "should-deploy=false"
