@@ -282,6 +282,8 @@ jobs:
           - studio-management
           - kb-worker
           - insights
+          - message-capture
+          - message-processor
     steps:
       - uses: actions/checkout@v4
         with:

@@ -43,6 +43,8 @@ on:
       - 'studio-management/**'
       - 'kb-worker/**'
       - 'workflow-gateway/**'
+      - 'message-capture/**'
+      - 'message-processor/**'
   
   workflow_dispatch:
     inputs:
@@ -184,7 +186,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for service in account catalog config connection portal run storage subscription task trigger webhook insights notification ai-runtime studio-management kb-worker workflow-gateway; do
+          for service in account catalog config connection portal run storage subscription task trigger webhook insights notification ai-runtime studio-management kb-worker workflow-gateway message-capture message-processor; do
             if [ -d "$service" ]; then
               echo "Building $service..."
               cd $service
